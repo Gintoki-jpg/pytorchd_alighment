@@ -1,21 +1,16 @@
-# 在这个版本上进行调整，接下来增加多视角约束
+# 9/29 16:42 在这个版本上进行调整，接下来增加法线约束
+# 9/29 20:54 本质上法线并不属于GT，因此约束没什么意义
 
 import os
 import torch
 import numpy as np
 from tqdm import tqdm
-import imageio
 import torch.nn as nn
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
-# from skimage import img_as_ubyte
-from PIL import Image
 import argparse
 import cv2
 import ast
-import pytorch3d
 from pytorch3d.renderer.mesh.shader import ShaderBase
-import os
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 
 
@@ -25,8 +20,6 @@ from pytorch3d.io import load_obj
 # Meshes用于存储和操作3D网格数据结构
 from pytorch3d.structures import Meshes
 
-# Rotate进行3D旋转变换，Translate进行3D平移变换
-from pytorch3d.transforms import Rotate, Translate
 
 from pytorch3d.renderer import (
     FoVPerspectiveCameras, look_at_view_transform, look_at_rotation,
@@ -122,7 +115,7 @@ class NormalShader(ShaderBase):
         # Normalize and map normals to [0, 1] for visualization
         colors = (pixel_normals + 1) / 2
 
-        return colors
+        return colors,pixel_normals # rgb？yes
 
 
 def create_renderer(renderer_type,image_size,blend_params,cameras,device,light_position=None):
@@ -184,8 +177,6 @@ def create_renderer(renderer_type,image_size,blend_params,cameras,device,light_p
         return normal_renderer
 
 
-import torch
-
 def get_rotation_matrix(pitch, yaw, roll):
     # Ensure pitch, yaw, roll are tensors with requires_grad=True
     pitch = pitch.unsqueeze(0) if pitch.dim() == 0 else pitch
@@ -237,51 +228,72 @@ def get_rotation_matrix(pitch, yaw, roll):
 
 
 class Model(nn.Module):
-    def __init__(self, meshes, renderer, image_ref_1,camera_location,camera_rotation):
+    def __init__(self, meshes, img_renderer,normal_renderer, image_ref,normal_ref,camera_location,camera_rotation):
         super().__init__()
-        self.meshes = meshes             # 存储3D网格对象
+        self.meshes = meshes
         self.device = meshes.device
-        self.renderer = renderer         # 存储渲染器对象
+        self.img_renderer = img_renderer
+        self.normal_renderer = normal_renderer
 
+        image_ref = torch.from_numpy(image_ref)
+        self.register_buffer('image_ref', image_ref)
 
-        image_ref_1 = torch.from_numpy(image_ref_1)
-        self.register_buffer('image_ref_1', image_ref_1)
+        normal_ref = torch.from_numpy(normal_ref)
+        self.register_buffer('normal_ref', normal_ref)
+
 
         self.camera_rotation_angle = nn.Parameter(
             torch.from_numpy(np.array(camera_rotation, dtype=np.float32)).to(meshes.device)
         )
 
-        # find rotation matrix from three rotation angles
         self.camera_position = nn.Parameter(
             torch.from_numpy(np.array(camera_location, dtype=np.float32)).to(meshes.device))
 
-        # self.loss_eval = nn.CrossEntropyLoss()
-        self.loss_eval = nn.L1Loss()
+        # self.loss_eval_1 = nn.CrossEntropyLoss()
+        self.loss_eval_1 = nn.L1Loss()
+
+        self.loss_eval_2 = nn.MSELoss()
+        # self.loss_eval_2 = nn.L1Loss()
 
 
     def forward(self):
         R = get_rotation_matrix(self.camera_rotation_angle[0],self.camera_rotation_angle[1],self.camera_rotation_angle[2]).unsqueeze(0).to(self.device)
         T = -torch.bmm(R.transpose(1, 2), self.camera_position[None, :, None])[:, :, 0]  # (1, 3)
 
-        image_1 = self.renderer(meshes_world=self.meshes.clone(), R=R, T=T)
-        alpha_mask = image_1[0, ..., 3]  # 这个alpha通道并不一定是0-1二值化
+        image = self.img_renderer(meshes_world=self.meshes.clone(), R=R, T=T)
+        # 此处不能执行0-1二值处理，导致梯度无法回传
+        alpha_mask = image[0, ..., 3]
 
-        loss = self.loss_eval(alpha_mask, self.image_ref_1)
 
-        return loss, alpha_mask
+        # _,pixel_normals = self.normal_renderer(meshes_world=self.meshes.clone(), R=R, T=T) # bgr [0,1] (1, H, W, 3)
+        # pred_normals = pixel_normals[0]
+        pred_normals = torch.zeros_like(self.normal_ref)
+        # color_normal = color_normal[0] # for visual
+
+        img_loss = self.loss_eval_1(alpha_mask, self.image_ref)
+        # normal_loss = self.loss_eval_2(pred_normals, self.normal_ref)
+        # loss = img_loss + normal_loss
+        loss = img_loss # 对chicken只使用mask损失看看效果（因为Mask和物体完全一致）
+
+        return loss, alpha_mask,pred_normals
 
 def main():
     parser = argparse.ArgumentParser(description="Process some parameters for the rendering program.")
-    parser.add_argument('--obj_path', type=str, default='./data/pineapple_center.obj', help='Path to the .obj file')
-    parser.add_argument('--start_end_output', type=str, default='./visualization.png',
-                        help='Output path for start and end comparison image')
-    parser.add_argument('--filename_output', type=str, default='./camera_optimization_demo.gif',
-                        help='Output path for the rendered GIF')
-    parser.add_argument('--mask_path_1', type=str, default='./data/mask.png',help='Path to the first mask file')
+    # parser.add_argument('--obj_path', type=str, default='./data/pineapple_center.obj', help='Path to the .obj file')
+    # parser.add_argument('--obj_path', type=str, default='./data/rooster_center.obj', help='Path to the .obj file')
+    parser.add_argument('--obj_path', type=str, default='./data/rooster_rate.obj', help='Path to the .obj file')
+    parser.add_argument('--mask_path', type=str, default='./data/mask.png',help='Path to the reference mask image')
+    parser.add_argument('--normal_path', type=str, default='./data/normal.png', help='Path to the reference normal image')
+
     parser.add_argument('--camera_location', type=parse_tuple, default=(0,0,200), help='Initial camera location')
     parser.add_argument('--camera_rotation', type=parse_nested_list, default=[0, np.pi, 0], help='Initial camera rotation')
+
     parser.add_argument('--loop_num', type=int, default=5000, help='Number of iterations')
+
+    # 约束的时候如果使用原始分辨率大小需要的时间非常长
     parser.add_argument('--image_size', type=parse_tuple, default=(128, 153), help='Size of the output image')
+    # parser.add_argument('--image_size', type=parse_tuple, default=(256, 306), help='Size of the output image')
+    # parser.add_argument('--image_size', type=parse_tuple, default=(1024, 1224), help='Size of the output image')
     parser.add_argument('--final_image_size', type=parse_tuple, default=(1024, 1224), help='Size of the output normal image')
 
     args = parser.parse_args()
@@ -294,7 +306,8 @@ def main():
         device = torch.device("cpu")
 
     obj_path = args.obj_path
-    mask_path_1 = args.mask_path_1
+    mask_path = args.mask_path
+    normal_path = args.normal_path
 
     camera_location = args.camera_location
     camera_rotation = args.camera_rotation
@@ -302,52 +315,72 @@ def main():
     image_size = args.image_size
     final_image_size = args.final_image_size
 
-    # 加载物体的3D网格数据(这里并没有对obj进行缩放，这里的bounding box和blender中完全一样)
     obj_mesh = load_obj_mesh(obj_path,device=device)
-    cameras = FoVPerspectiveCameras(znear=0.1, zfar=10000, aspect_ratio=1, fov=30, degrees=True, device=device)
+    # cameras = FoVPerspectiveCameras(znear=0.1, zfar=10000, aspect_ratio=1, fov=30, degrees=True, device=device)
+    cameras = FoVPerspectiveCameras(znear=0.1, zfar=10000, aspect_ratio=1, fov=29.16, degrees=True, device=device)
     blend_params = BlendParams(sigma=1e-4, gamma=1e-4)  # 默认渲染参数
 
     silhouette_renderer = create_renderer('SoftSilhouetteShader',image_size=image_size,blend_params=blend_params,cameras=cameras,device=device)
-    if mask_path_1 is not None:
-        image_ref_1 = load_mask(mask_path_1)
-        # for debug
-        image_ref_1 = cv2.resize(image_ref_1, (image_size[1], image_size[0]))
+    normal_renderer = create_renderer('NormalShader',image_size=image_size,blend_params=blend_params,cameras=cameras,device=device)
+
+    if mask_path is not None:
+        image_ref = load_mask(mask_path)
+        # for accelate the optimization process
+        image_ref_resize = cv2.resize(image_ref, (image_size[1], image_size[0]))
+        # 0-1二值化处理
+        image_ref_resize = (image_ref_resize > 0).astype(np.float32)
+    if normal_path is not None:
+        # normal_ref = cv2.imread(normal_path, -1)[..., ::-1] # bgr -> rgb
+        normal_ref = cv2.imread(normal_path, -1)[..., ::-1] # bgr -> rgb
+        if normal_ref.dtype == np.uint16:
+            normal_ref = normal_ref.astype(np.float32) / 65535.0 * 2 - 1
+        else:
+            normal_ref = normal_ref.astype(np.float32) / 255.0 * 2 - 1
+        #apply mask
+        normal_ref = normal_ref * (image_ref[..., None] > 0)
+        # resize to the same size
+        normal_ref_resize = cv2.resize(normal_ref, (image_size[1], image_size[0]))
+        # 归一化法线[-1,1]且长度为1
+        epsilon = 1e-10
+        normal_ref_resize = normal_ref_resize / (np.linalg.norm(normal_ref_resize, axis=2, keepdims=True) + epsilon)
 
 
-    model = Model(meshes=obj_mesh, renderer=silhouette_renderer, image_ref_1=image_ref_1,camera_location=camera_location,camera_rotation=camera_rotation).to(device)
+    model = Model(meshes=obj_mesh, img_renderer=silhouette_renderer,normal_renderer=normal_renderer,image_ref=image_ref_resize,normal_ref=normal_ref_resize,camera_location=camera_location,camera_rotation=camera_rotation).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
 
-    _, image_init = model()
-   
-    # # 处理第一张图像（Starting position）
-    # # 从 tensor 转为 numpy 数组，并取第4通道
-    # image_init_np = image_init.detach().squeeze().cpu().numpy()[..., 3]
-    # # 确保图像是灰度图像（cv2 expects uint8 for grayscale images）
-    # image_init_np = (image_init_np * 255).astype(np.uint8)
-    # # 使用 cv2 保存第一张图像
-    # cv2.imwrite("starting_position.png", image_init_np)
-    # # 处理第二张图像（Reference position）
-    # image_ref_np = model.image_ref_1.cpu().numpy().squeeze()
-    # # 同样转换为 uint8 类型的灰度图像
-    # image_ref_np = (image_ref_np * 255).astype(np.uint8)
-    # # 使用 cv2 保存第二张图像
-    # cv2.imwrite("reference_position.png", image_ref_np)
+    # 添加学习率调度器
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.5)  # 学习率衰减
+
+    _, image_init,normal_init = model()
+
+
 
     loop = tqdm(range(loop_num))  # 设置循环
     for i in loop:
         optimizer.zero_grad()  # 清零优化器中的梯度
-        loss, mask_pred = model()  # 获取当前相机位置下的损失
+        loss, mask_pred,normal_pred = model()  # 获取当前相机位置下的损失
         loss.backward()  # 反向传播计算梯度
         optimizer.step()  # 更新模型参数（即相机位置R和T）
+        # 更新学习率
+        scheduler.step()
         # 在进度条上显示当前损失值
         loop.set_description('Optimizing (loss %.4f)' % loss.data)
 
         if i % 200 == 0:
             # draw the alpha mask and self.image_ref_1
-            plt.subplot(1, 2, 1)
+            plt.subplot(1, 4, 1)
             plt.imshow(mask_pred.cpu().detach().numpy())
-            plt.subplot(1, 2, 2)
-            plt.imshow(model.image_ref_1.cpu().detach().numpy())
+            # plt.axis("off")
+            plt.subplot(1, 4, 2)
+            plt.imshow(model.image_ref.cpu().detach().numpy())
+            plt.axis("off")
+            plt.subplot(1, 4, 3)
+            plt.imshow(normal_pred.cpu().detach().numpy())
+            plt.axis("off")
+            plt.subplot(1, 4, 4)
+            plt.imshow((model.normal_ref).cpu().detach().numpy())
+            plt.axis("off")
             plt.title('loss: %.4f' % loss.data)
             # plt.savefig('camera_optimization_{:>3d}.png'.format(i))
             plt.show()
@@ -365,14 +398,14 @@ def main():
     print("对齐旋转矩阵：" + str(R))
     print("对齐平移向量：" + str(T))
 
-    # 保存最终的渲染结果（渲染法线图）
-    normal_renderer = create_renderer('NormalShader',image_size=final_image_size,blend_params=blend_params,cameras=cameras,device=device)
-    image_final = normal_renderer(meshes_world=model.meshes.clone(), R=R, T=T)
-    image_final = image_final.detach().squeeze().cpu().numpy()
-    image_final = (image_final * 255).astype(np.uint8)
-    # 切换通道顺序 brg -> rgb
-    image_final = image_final[..., ::-1]
-    cv2.imwrite("final_position.png", image_final)
+    # 保存最终的渲染结果（渲染法线图）,以原始分辨率输出
+    final_normal_renderer = create_renderer('NormalShader',image_size=final_image_size,blend_params=blend_params,cameras=cameras,device=device)
+    normal_final,_ = final_normal_renderer(meshes_world=model.meshes.clone(), R=R, T=T)
+    normal_final = normal_final.detach().squeeze().cpu().numpy()
+    normal_final = (normal_final * 255).astype(np.uint8)
+    # 切换通道顺序 brg -> rgb(本质上是因为cv2.imwrite默认bgr通道写入)
+    normal_final = normal_final[..., ::-1]
+    cv2.imwrite("final_normal.png", normal_final)
 
 
 if __name__ == '__main__':
