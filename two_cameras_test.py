@@ -297,7 +297,8 @@ class Model(nn.Module):
          torch.from_numpy(np.array(camera_location, dtype=np.float32)).to(meshes.device))
 
         # self.loss_eval_1 = nn.CrossEntropyLoss()
-        self.loss_eval_1 = nn.L1Loss()
+        # self.loss_eval_1 = nn.L1Loss()
+        self.loss_eval_1 = nn.MSELoss()
 
         # self.loss_eval_2 = nn.MSELoss()
         # self.loss_eval_2 = nn.L1Loss()
@@ -365,8 +366,8 @@ def main():
     """
 
     parser = argparse.ArgumentParser(description="Process some parameters for the rendering program.")
-    # parser.add_argument('--obj_path', type=str, default='./data/blackdog_center.obj', help='Path to the .obj file')
-    parser.add_argument('--obj_path', type=str, default='./data/dog_rotate_clean.obj', help='Path to the .obj file')
+    parser.add_argument('--obj_path', type=str, default='./data/dog-delaunay_clean.obj', help='Path to the .obj file')
+    # parser.add_argument('--obj_path', type=str, default='./data/dog_rotate_clean.obj', help='Path to the .obj file')
     # parser.add_argument('--mask_path', type=str, default='./data/mask_00.png', help='Path to the reference mask image')
     parser.add_argument('--mask_path', type=str, default='./data/mask_00.png', help='Path to the reference mask image')
     parser.add_argument('--mask_path_2', type=str, default='./data/mask_05.png', help='Path to the reference mask image')
@@ -423,7 +424,8 @@ def main():
 
     obj_mesh = load_obj_mesh(obj_path, device=device)
     # cameras = FoVPerspectiveCameras(znear=0.1, zfar=10000, aspect_ratio=1, fov=30, degrees=True, device=device)
-    cameras = FoVPerspectiveCameras(znear=0.1, zfar=10000, aspect_ratio=1, fov=29.16, degrees=True, device=device)
+    # cameras = FoVPerspectiveCameras(znear=0.1, zfar=10000, aspect_ratio=1, fov=29.16, degrees=True, device=device)
+    cameras = PerspectiveCameras(focal_length=((291.76901860550583,291.76901860550583),), principal_point=((76.6875, 64.0625),), in_ndc=False,image_size=((128, 153),), device=device)
     blend_params = BlendParams(sigma=1e-4, gamma=1e-4)  # 默认渲染参数
 
     silhouette_renderer = create_renderer('SoftSilhouetteShader', image_size=image_size, blend_params=blend_params,
@@ -463,7 +465,7 @@ def main():
                   image_ref=image_ref_resize_1, image_ref_2=image_ref_resize_2, camera_location=camera_location,
                   camera_rotation=camera_rotation_angle,R_rel=R_rel,T_rel=T_rel).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     # optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
 
     # 添加学习率调度器
@@ -486,6 +488,7 @@ def main():
     for i in loop:
         optimizer.zero_grad()  # 清零优化器中的梯度
         loss, mask_pred,mask_pred_2 = model()  # 获取当前相机位置下的损失
+        print('loss is :',loss.data)
         loss.backward()  # 反向传播计算梯度
         optimizer.step()  # 更新模型参数（即相机位置R和T）
         # 更新学习率
