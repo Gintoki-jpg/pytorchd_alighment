@@ -303,22 +303,27 @@ class Model(nn.Module):
         # self.loss_eval_2 = nn.L1Loss()
 
     def forward(self):
-        # 此处的R和T都应该是W2C的，之前原始的look_at_rotation函数返回的也是R的转置，即W2C下的R -- 3D规定了必须使用W2C下的执行渲染
+        # 此处的R和T都应该是W2C的，之前原始的look_at_rotation函数返回的也是R的转置，即W2C下的R -- pytorch规定了必须使用W2C下的执行渲染
         # R = self.camera_rotation
-        R = get_rotation_matrix(self.camera_rotation[0], self.camera_rotation[1], self.camera_rotation[2]) # w2c
+        R = get_rotation_matrix(self.camera_rotation[0], self.camera_rotation[1], self.camera_rotation[2]) # w2c （同样存在转换误差）
         T = self.camera_position
+        # 将列主序转换为行主序(pytorch3d中使用行主序渲染，numpy等使用列主序)
+        R_row = R.permute(0, 2, 1)
+
 
         # R = R.unsqueeze(0)
         T = T.unsqueeze(0)
 
+        # 这个地方的转换存在一定的计算误差，会影响最终的结果（R_rel和T_rel不可能保证完全精确的转换）
         R_2_W2C, T_2_W2C = cal_R2_RT(R, T, self.R_rel, self.T_rel)
+        R_2_W2C_row = R_2_W2C.permute(0, 2, 1)
 
         # Render the image(R and T are all w2c)
-        image = self.img_renderer(meshes_world=self.meshes.clone(), R=R, T=T)
+        image = self.img_renderer(meshes_world=self.meshes.clone(), R=R_row, T=T)
         # 此处不能执行0-1二值处理，导致梯度无法回传
         alpha_mask = image[0, ..., 3]
 
-        image_2 = self.img_renderer(meshes_world=self.meshes.clone(), R=R_2_W2C, T=T_2_W2C)
+        image_2 = self.img_renderer(meshes_world=self.meshes.clone(), R=R_2_W2C_row, T=T_2_W2C)
         alpha_mask_2 = image_2[0, ..., 3]
 
         # _,pixel_normals = self.normal_renderer(meshes_world=self.meshes.clone(), R=R, T=T) # bgr [0,1] (1, H, W, 3)
@@ -338,21 +343,21 @@ def main():
     """如何获取camera_location，camera_rotation，R_rel，T_rel
 
         执行 python render_colmap_mesh.py 可以得到如下输出(all is w2c)
-        pytorch3d W2C R_0 is tensor([[[ 0.2654,  0.5792,  0.7707],
-             [-0.4987, -0.6016,  0.6239],
-             [ 0.8251, -0.5500,  0.1292]]])
+        pytorch3d W2C R_0 is tensor([[ 0.2654, -0.4987,  0.8251],
+                [ 0.5792, -0.6016, -0.5500],
+                [ 0.7707,  0.6239,  0.1292]])
         pytorch3d W2C T_0 is tensor([[-0.0654,  2.6518,  3.5998]])
-        pytorch3d W2C R_5 is tensor([[[ 0.9441, -0.1215, -0.3064],
-                 [ 0.2317, -0.4167,  0.8790],
-                 [-0.2345, -0.9009, -0.3653]]])
+        pytorch3d W2C R_5 is tensor([[ 0.9441,  0.2317, -0.2345],
+                [-0.1215, -0.4167, -0.9009],
+                [-0.3064,  0.8790, -0.3653]])
         pytorch3d W2C T_5 is tensor([[0.8173, 2.4132, 3.2653]])
-        R_rel tensor([[[-0.0559, -0.5889,  0.8062],
-                 [ 0.4976,  0.6836,  0.5339],
-                 [-0.8656,  0.4310,  0.2548]]], device='cuda:0')
-        T_rel tensor([[-0.5269, -1.2890,  1.1484]], device='cuda:0')
-        R2 tensor([[[[ 0.9441, -0.1215, -0.3064],
-                  [ 0.2317, -0.4167,  0.8790],
-                  [-0.2345, -0.9009, -0.3653]]]], device='cuda:0')
+        R_rel tensor([[[-0.0584,  0.5365,  0.8419],
+                 [-0.5677,  0.6758, -0.4700],
+                 [-0.8211, -0.5054,  0.2651]]], device='cuda:0')
+        T_rel tensor([[-3.6398,  2.2759,  3.5975]], device='cuda:0')
+        R2 tensor([[[[ 0.9441,  0.2317, -0.2345],
+                  [-0.1215, -0.4167, -0.9009],
+                  [-0.3064,  0.8790, -0.3653]]]], device='cuda:0')
         T2 tensor([[[0.8173, 2.4132, 3.2653]]], device='cuda:0')
 
     其中的R_0，T_0对应camera_location，camera_rotation，R_rel和T_rel分别对应R_rel和T_rel
@@ -370,15 +375,15 @@ def main():
 
     # 假设输入的R和T都是pytorch3d W2C下直接计算得到的3*3旋转矩阵和1*3平移向量
     parser.add_argument('--camera_location', type=parse_tuple, default=([-0.0654,  2.6518,  3.5998]), help='Initial camera location(w2c)')
-    parser.add_argument('--camera_rotation', type=parse_nested_list, default=([[0.2654, 0.5792, 0.7707],
-                                                                                         [-0.4987, -0.6016, 0.6239],
-                                                                                         [0.8251, -0.5500, 0.1292]]), help='Initial camera rotation(w2c)')
+    parser.add_argument('--camera_rotation', type=parse_nested_list, default=([[ 0.2654, -0.4987,  0.8251],
+                                                                                            [ 0.5792, -0.6016, -0.5500],
+                                                                                            [ 0.7707,  0.6239,  0.1292]]), help='Initial camera rotation(w2c)')
 
     # 加入pytorch3d C2W下的相对R和相对T，基于COLMAP的尺度计算得到
-    parser.add_argument('--R_rel', type=parse_nested_list, default=([[-0.0559, -0.5889,  0.8062],
-                                                                                 [ 0.4976,  0.6836,  0.5339],
-                                                                                 [-0.8656,  0.4310,  0.2548]]), help='Relative rotation matrix')
-    parser.add_argument('--T_rel', type=parse_tuple, default=([-0.5269, -1.2890,  1.1484]), help='Relative translation vector')
+    parser.add_argument('--R_rel', type=parse_nested_list, default=([[-0.0584,  0.5365,  0.8419],
+                                                                                     [-0.5677,  0.6758, -0.4700],
+                                                                                     [-0.8211, -0.5054,  0.2651]]), help='Relative rotation matrix')
+    parser.add_argument('--T_rel', type=parse_tuple, default=([-3.6398,  2.2759,  3.5975]), help='Relative translation vector')
 
 
     parser.add_argument('--loop_num', type=int, default=5000, help='Number of iterations')
