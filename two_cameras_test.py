@@ -233,14 +233,13 @@ def get_rotation_matrix(pitch, yaw, roll):
      torch.stack([zeros, zeros, ones], dim=-1)
     ], dim=-2)
 
-    # Combine the rotation matrices
+    # Combine the rotation matrices C2W
     R = torch.matmul(R_z, torch.matmul(R_y, R_x))
 
     # # If the inputs were scalars, remove the extra dimension
     # if R.shape[0] == 1:
     #     R = R.squeeze(0)
-    # C2W -> W2C
-    R.transpose(1, 2)
+
     return R
 
 
@@ -248,10 +247,23 @@ def extract_euler_angles(R):
     # 确保 R 是一个 3x3 矩阵
     assert R.shape == (3, 3)
 
-    # 计算 yaw, pitch, roll
-    yaw = np.arctan2(R[1, 0], R[0, 0])
-    pitch = np.arctan2(-R[2, 0], np.sqrt(R[0, 0]**2 + R[1, 0]**2))
-    roll = np.arctan2(R[2, 1], R[2, 2])
+    # 提取旋转矩阵的元素
+    r11, r12, r13 = R[0, :]
+    r21, r22, r23 = R[1, :]
+    r31, r32, r33 = R[2, :]
+
+    # # 计算 yaw, pitch, roll
+    # yaw = np.arctan2(R[1, 0], R[0, 0])
+    # pitch = np.arctan2(-R[2, 0], np.sqrt(R[0, 0]**2 + R[1, 0]**2))
+    # roll = np.arctan2(R[2, 1], R[2, 2])
+
+    yaw = torch.asin(-r31)
+
+    # Calculate pitch
+    pitch = torch.atan2(r32, r33)
+
+    # Calculate roll
+    roll = torch.atan2(r21, r11)
 
     return pitch, yaw, roll
 
@@ -269,13 +281,13 @@ class Model(nn.Module):
 
         # normal_ref = torch.from_numpy(normal_ref)
         # self.register_buffer('normal_ref', normal_ref)
-        img_ref_2 = torch.from_numpy(image_ref_2)
-        self.register_buffer('image_ref_2', img_ref_2)
+        image_ref_2 = torch.from_numpy(image_ref_2)
+        self.register_buffer('image_ref_2', image_ref_2)
 
         self.R_rel = torch.from_numpy(np.array(R_rel, dtype=np.float32)).to(meshes.device)
         self.T_rel = torch.from_numpy(np.array(T_rel, dtype=np.float32)).to(meshes.device)
 
-        # 此处的R是3*3的旋转矩阵W2C
+        # 此处的R是1*3旋转角
         self.camera_rotation = nn.Parameter(
          torch.from_numpy(np.array(camera_rotation, dtype=np.float32)).to(meshes.device)
         )
@@ -287,15 +299,16 @@ class Model(nn.Module):
         # self.loss_eval_1 = nn.CrossEntropyLoss()
         self.loss_eval_1 = nn.L1Loss()
 
-        self.loss_eval_2 = nn.MSELoss()
+        # self.loss_eval_2 = nn.MSELoss()
         # self.loss_eval_2 = nn.L1Loss()
 
     def forward(self):
         # 此处的R和T都应该是W2C的，之前原始的look_at_rotation函数返回的也是R的转置，即W2C下的R -- 3D规定了必须使用W2C下的执行渲染
-        R = self.camera_rotation
+        # R = self.camera_rotation
+        R = get_rotation_matrix(self.camera_rotation[0], self.camera_rotation[1], self.camera_rotation[2]) # w2c
         T = self.camera_position
 
-        R = R.unsqueeze(0)
+        # R = R.unsqueeze(0)
         T = T.unsqueeze(0)
 
         R_2_W2C, T_2_W2C = cal_R2_RT(R, T, self.R_rel, self.T_rel)
@@ -322,6 +335,30 @@ class Model(nn.Module):
         return loss, alpha_mask,alpha_mask_2
 
 def main():
+    """如何获取camera_location，camera_rotation，R_rel，T_rel
+
+        执行 python render_colmap_mesh.py 可以得到如下输出(all is w2c)
+        pytorch3d W2C R_0 is tensor([[[ 0.2654,  0.5792,  0.7707],
+             [-0.4987, -0.6016,  0.6239],
+             [ 0.8251, -0.5500,  0.1292]]])
+        pytorch3d W2C T_0 is tensor([[-0.0654,  2.6518,  3.5998]])
+        pytorch3d W2C R_5 is tensor([[[ 0.9441, -0.1215, -0.3064],
+                 [ 0.2317, -0.4167,  0.8790],
+                 [-0.2345, -0.9009, -0.3653]]])
+        pytorch3d W2C T_5 is tensor([[0.8173, 2.4132, 3.2653]])
+        R_rel tensor([[[-0.0559, -0.5889,  0.8062],
+                 [ 0.4976,  0.6836,  0.5339],
+                 [-0.8656,  0.4310,  0.2548]]], device='cuda:0')
+        T_rel tensor([[-0.5269, -1.2890,  1.1484]], device='cuda:0')
+        R2 tensor([[[[ 0.9441, -0.1215, -0.3064],
+                  [ 0.2317, -0.4167,  0.8790],
+                  [-0.2345, -0.9009, -0.3653]]]], device='cuda:0')
+        T2 tensor([[[0.8173, 2.4132, 3.2653]]], device='cuda:0')
+
+    其中的R_0，T_0对应camera_location，camera_rotation，R_rel和T_rel分别对应R_rel和T_rel
+
+    """
+
     parser = argparse.ArgumentParser(description="Process some parameters for the rendering program.")
     # parser.add_argument('--obj_path', type=str, default='./data/blackdog_center.obj', help='Path to the .obj file')
     parser.add_argument('--obj_path', type=str, default='./data/dog_rotate_clean.obj', help='Path to the .obj file')
@@ -332,10 +369,10 @@ def main():
     # parser.add_argument('--normal_path', type=str, default='./data/normal_00.png', help='Path to the reference normal image')
 
     # 假设输入的R和T都是pytorch3d W2C下直接计算得到的3*3旋转矩阵和1*3平移向量
-    parser.add_argument('--camera_location', type=parse_tuple, default=([-0.0654,  2.6518,  3.5998]), help='Initial camera location')
+    parser.add_argument('--camera_location', type=parse_tuple, default=([-0.0654,  2.6518,  3.5998]), help='Initial camera location(w2c)')
     parser.add_argument('--camera_rotation', type=parse_nested_list, default=([[0.2654, 0.5792, 0.7707],
                                                                                          [-0.4987, -0.6016, 0.6239],
-                                                                                         [0.8251, -0.5500, 0.1292]]), help='Initial camera rotation')
+                                                                                         [0.8251, -0.5500, 0.1292]]), help='Initial camera rotation(w2c)')
 
     # 加入pytorch3d C2W下的相对R和相对T，基于COLMAP的尺度计算得到
     parser.add_argument('--R_rel', type=parse_nested_list, default=([[-0.0559, -0.5889,  0.8062],
@@ -371,6 +408,8 @@ def main():
 
     camera_location = args.camera_location
     camera_rotation = args.camera_rotation
+    camera_rotation_angle = extract_euler_angles(torch.tensor(camera_rotation, dtype=torch.float32))
+
     loop_num = args.loop_num
     image_size = args.image_size
     final_image_size = args.final_image_size
@@ -412,9 +451,12 @@ def main():
     #     epsilon = 1e-10
     #     normal_ref_resize = normal_ref_resize / (np.linalg.norm(normal_ref_resize, axis=2, keepdims=True) + epsilon)
 
+    # model = Model(meshes=obj_mesh, img_renderer=silhouette_renderer, normal_renderer=normal_renderer,
+    #               image_ref=image_ref_resize_1, image_ref_2=image_ref_resize_2, camera_location=camera_location,
+    #               camera_rotation=camera_rotation,R_rel=R_rel,T_rel=T_rel).to(device)
     model = Model(meshes=obj_mesh, img_renderer=silhouette_renderer, normal_renderer=normal_renderer,
                   image_ref=image_ref_resize_1, image_ref_2=image_ref_resize_2, camera_location=camera_location,
-                  camera_rotation=camera_rotation,R_rel=R_rel,T_rel=T_rel).to(device)
+                  camera_rotation=camera_rotation_angle,R_rel=R_rel,T_rel=T_rel).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
     # optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
@@ -426,11 +468,11 @@ def main():
     # 展示图片
     plt.figure(figsize=(10, 10))
     plt.subplot(1, 2, 1)
-    plt.imshow(image_init.cpu().detach().numpy(), cmap='gray')
+    plt.imshow(image_init.cpu().detach().numpy())
     plt.title('Initial image')
     plt.axis('off')
     plt.subplot(1, 2, 2)
-    plt.imshow(image_init_2.cpu().detach().numpy(), cmap='gray')
+    plt.imshow(image_init_2.cpu().detach().numpy())
     plt.title('Initial image_2')
     plt.axis('off')
     plt.show()

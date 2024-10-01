@@ -46,8 +46,8 @@ def get_rotation_matrix(pitch, yaw, roll):
     # # If the inputs were scalars, remove the extra dimension
     # if R.shape[0] == 1:
     #     R = R.squeeze(0)
-    # C2W -> W2C
-    R.transpose(1, 2)
+    # C2W -> W2C  # 请不要执行过多无效的转换
+    # R.transpose(1, 2)
     return R
 
 def extract_euler_angles(R):
@@ -55,30 +55,41 @@ def extract_euler_angles(R):
     assert R.shape == (3, 3)
 
     # 首先对输入的W2C R执行转置操作获得C2W下的R
-    R = R.T
+    # R = R.T
 
     # 提取旋转矩阵的元素
     r11, r12, r13 = R[0, :]
     r21, r22, r23 = R[1, :]
     r31, r32, r33 = R[2, :]
 
-    # 计算俯仰角（pitch）
-    pitch = np.arctan2(-r31, np.sqrt(r32 ** 2 + r33 ** 2))
+    # # 计算俯仰角（pitch）
+    # pitch = np.arctan2(-r31, np.sqrt(r32 ** 2 + r33 ** 2))
+    #
+    # # 计算偏航角（yaw）
+    # yaw = np.arctan2(r32, r33)
+    #
+    # # 计算滚转角（roll）
+    # roll = np.arctan2(r21, r11)
+    # Calculate yaw
+    yaw = torch.asin(-r31)
 
-    # 计算偏航角（yaw）
-    yaw = np.arctan2(r32, r33)
+    # Calculate pitch
+    pitch = torch.atan2(r32, r33)
 
-    # 计算滚转角（roll）
-    roll = np.arctan2(r21, r11)
+    # Calculate roll
+    roll = torch.atan2(r21, r11)
 
     return pitch, yaw, roll
 
 
 
 # 给定的旋转矩阵（这个旋转矩阵是W2C下的旋转矩阵）
-R = np.array([[0.2654, 0.5792, 0.7707],
-              [-0.4987, -0.6016, 0.6239],
-              [0.8251, -0.5500, 0.1292]])
+# R = np.array([[0.2654, 0.5792, 0.7707],
+#               [-0.4987, -0.6016, 0.6239],
+#               [0.8251, -0.5500, 0.1292]])
+R = torch.tensor([[0.2654, 0.5792, 0.7707],
+                  [-0.4987, -0.6016, 0.6239],
+                  [0.8251, -0.5500, 0.1292]])
 
 
 pitch, yaw, roll = extract_euler_angles(R)
@@ -93,4 +104,6 @@ R = get_rotation_matrix(pitch, yaw, roll)
 print("Pitch:", pitch)
 print("Yaw:", yaw)
 print("Roll:", roll)
+
+print("Rotation matrix:", R)
 
