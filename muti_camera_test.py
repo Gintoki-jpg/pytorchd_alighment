@@ -139,18 +139,20 @@ class NormalShader(ShaderBase):
 def create_renderer(renderer_type, image_size, blend_params, cameras, device, light_position=None):
     if renderer_type == 'SoftSilhouetteShader':
         Silhouette_raster_settings = RasterizationSettings(
-         image_size=image_size,  # 输出图像的大小(height,width)
-         blur_radius=np.log(1. / 1e-4 - 1.) * blend_params.sigma,  # 模糊半径，基于混合参数计算
-         faces_per_pixel=100,  # 每个像素的面数，用于混合和抗锯齿
-         bin_size=0
+            image_size=image_size,  # 输出图像的大小(height,width)
+            # blur_radius=np.log(1. / 1e-4 - 1.) * blend_params.sigma,  # 模糊半径，基于混合参数计算
+            # blur_radius=np.log(1. / 1e-3 - 1.) * blend_params.sigma,
+            blur_radius=0.0001,  # 模糊半径
+            faces_per_pixel=100,
+            bin_size=0
         )
 
         silhouette_renderer = MeshRenderer(
-         rasterizer=MeshRasterizer(  # 将网格转换为屏幕上的像素
-          cameras=cameras,  # 使用之前创建的透视相机
-          raster_settings=Silhouette_raster_settings  # 使用配置好的栅格化设置
-         ),
-         shader=SoftSilhouetteShader(blend_params=blend_params)  # 使用软轮廓着色器，根据混合参数设置渲染图像
+            rasterizer=MeshRasterizer(  # 将网格转换为屏幕上的像素
+                cameras=cameras,  # 使用之前创建的透视相机
+                raster_settings=Silhouette_raster_settings  # 使用配置好的栅格化设置
+                ),
+            shader=SoftSilhouetteShader(blend_params=blend_params)  # 使用软轮廓着色器，根据混合参数设置渲染图像
         )
         return silhouette_renderer
 
@@ -161,34 +163,35 @@ def create_renderer(renderer_type, image_size, blend_params, cameras, device, li
             lights = PointLights(device=device, location=(light_position,))
 
         Phong_raster_settings = RasterizationSettings(
-         image_size=image_size,  # 图像大小
-         blur_radius=0.0,  # 模糊半径为0
-         faces_per_pixel=1,  # 每个像素仅渲染一个面
-         bin_size=0
+            image_size=image_size,  # 图像大小
+            blur_radius=0.0,  # 模糊半径为0
+            faces_per_pixel=1,  # 每个像素仅渲染一个面
+            bin_size=0
         )
 
         hard_phong_renderer = MeshRenderer(
-         rasterizer=MeshRasterizer(
-          cameras=cameras,
-          raster_settings=Phong_raster_settings  # 使用新的栅格化设置
-         ),
-         shader=HardPhongShader(device=device, cameras=cameras, lights=lights)  # 使用硬Phong着色器，结合相机和光源进行渲染
+            rasterizer=MeshRasterizer(
+                cameras=cameras,
+                raster_settings=Phong_raster_settings  # 使用新的栅格化设置
+                ),
+            shader=HardPhongShader(device=device, cameras=cameras, lights=lights)  # 使用硬Phong着色器，结合相机和光源进行渲染
         )
         return hard_phong_renderer
     elif renderer_type == 'NormalShader':
         normal_raster_settings = RasterizationSettings(
-          image_size=image_size,  # 图像大小
-          blur_radius=0.0,  # 模糊半径为0
-          faces_per_pixel=1,  # 每个像素仅渲染一个面
-          bin_size=0
+            image_size=image_size,  # 图像大小
+            # blur_radius=0.0,  # 模糊半径为0
+            blur_radius=0.0001,
+            faces_per_pixel=1,  # 每个像素仅渲染一个面
+            bin_size=0
          )
 
         normal_renderer = MeshRenderer(
-         rasterizer=MeshRasterizer(
-          cameras=cameras,
-          raster_settings=normal_raster_settings  # 使用新的栅格化设置
-         ),
-         shader=NormalShader(device=device)  # 使用自定义法线着色器
+            rasterizer=MeshRasterizer(
+                cameras=cameras,
+                raster_settings=normal_raster_settings  # 使用新的栅格化设置
+                ),
+            shader=NormalShader(device=device)  # 使用自定义法线着色器
         )
 
         return normal_renderer
@@ -297,7 +300,7 @@ def extract_rel_R_T_from_txt(txt_path):
     return R_rel_list, T_rel_list
 
 class Model(nn.Module):
-    def __init__(self, meshes, img_renderer, normal_renderer, image_ref_list,camera_location, camera_rotation,R_rel_list,T_rel_list):
+    def __init__(self, meshes, img_renderer, normal_renderer, image_ref_list,camera_location, camera_rotation,R_rel_list,T_rel_list,initial_scale):
         """
         :param meshes:
         :param img_renderer:
@@ -328,10 +331,13 @@ class Model(nn.Module):
             self.T_rel_list[k] = torch.tensor(T_rel_list[k], dtype=torch.float32, device=self.device)
 
         # 此处的R是1*3旋转角
-        self.camera_rotation = nn.Parameter(torch.from_numpy(np.array(camera_rotation, dtype=np.float32)).to(meshes.device))
+        self.camera_rotation = nn.Parameter(torch.from_numpy(np.array(camera_rotation, dtype=np.float32)).to(self.device))
 
         # 此处的T是1*3的平移向量W2C
-        self.camera_position = nn.Parameter(torch.from_numpy(np.array(camera_location, dtype=np.float32)).to(meshes.device))
+        self.camera_position = nn.Parameter(torch.from_numpy(np.array(camera_location, dtype=np.float32)).to(self.device))
+
+        # 设置网格缩放比例为可学习参数
+        self.scale = nn.Parameter(torch.tensor(initial_scale, dtype=torch.float32, device=self.device))
 
 
         # self.loss_eval_image = nn.MSELoss()
@@ -353,18 +359,24 @@ class Model(nn.Module):
             R_W2C_row_list.append(R_W2C_row)
             T_W2C_list.append(T_W2C)
 
+
+        # scale the mesh
+        verts = self.meshes.verts_packed()
+        scaled_verts = verts * self.scale
+        scaled_mesh = Meshes(verts=[scaled_verts], faces=self.meshes.faces_list())
+
         # render normal for compare
-        normal_image,_ = self.normal_renderer(meshes_world=self.meshes.clone(), R=R_row, T=T)
+        normal_image,_ = self.normal_renderer(meshes_world=scaled_mesh, R=R_row, T=T)
 
         # render the image for the origin camera and relative cameras
-        image_1 = self.img_renderer(meshes_world=self.meshes.clone(), R=R_row, T=T)
+        image_1 = self.img_renderer(meshes_world=scaled_mesh, R=R_row, T=T)
         alpha_1_mask = image_1[0, ..., 3]
-
+        # 此处无法执行二值化操作，会导致梯度消失
         alpha_mask_list = []
         alpha_mask_list.append(alpha_1_mask)
 
         for i in range(len(R_W2C_row_list)):
-            rel_image = self.img_renderer(meshes_world=self.meshes.clone(), R=R_W2C_row_list[i], T=T_W2C_list[i])
+            rel_image = self.img_renderer(meshes_world=scaled_mesh, R=R_W2C_row_list[i], T=T_W2C_list[i])
             alpha_mask = rel_image[0, ..., 3]
             alpha_mask_list.append(alpha_mask)
 
@@ -386,9 +398,10 @@ def main():
     parser.add_argument('--camera_rotation_location_txt', type=str, default='./data/face/R_T_col_0.txt', help='Path to the origin camera rotation and location txt file')
     parser.add_argument('--relative_rotation_location_txt', type=str, default='./data/face/R_T_rel.txt', help='Path to the relative rotation and location txt file')
     parser.add_argument('--relative_cameras',type = parse_nested_list,nargs='+',default=[5,10,15,20],help='The camera number for the pickle file')
-    parser.add_argument('--loop_num', type=int, default=3000, help='Number of iterations')
+    parser.add_argument('--loop_num', type=int, default=8000, help='Number of iterations')
     parser.add_argument('--image_size', type=parse_tuple, default=(128, 153), help='Size of the train image')
     parser.add_argument('--final_image_size', type=parse_tuple, default=(1024, 1224),help='Size of the output image')
+    parser.add_argument('--initial_scale', type=float, default=1.0, help='Initial scale of the mesh')
 
     parser.add_argument('--mask_paths', type=str, nargs='+', default=['./data/face/mask_00.png', './data/face/mask_05.png',
                                                                        './data/face/mask_10.png',
@@ -403,6 +416,7 @@ def main():
     train_image_size = args.image_size
     final_image_size = args.final_image_size
     relative_cameras = args.relative_cameras
+    initial_scale = args.initial_scale
     camera_rotaion_location_path = args.camera_rotation_location_txt
     relative_rotation_location_path = args.relative_rotation_location_txt
 
@@ -431,24 +445,29 @@ def main():
         for mask_path in mask_paths_list:
             mask = load_mask(mask_path)
             mask_resized = cv2.resize(mask, (train_image_size[1], train_image_size[0]))
-            # 此处到底是否需要转换为0-1的值？
-            # mask_resized = (mask_resized>0).astype(np.float32)
             mask_list.append(mask_resized)
 
 ############################################################################################################
-    model = Model(obj_mesh, silhouette_renderer, normal_renderer, mask_list, camera_location, camera_rotation_angle, R_rel_list, T_rel_list)
+    model = Model(obj_mesh, silhouette_renderer, normal_renderer, mask_list, camera_location, camera_rotation_angle, R_rel_list, T_rel_list,initial_scale)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    numOfStage  = 3
-    milestones = np.linspace(0, 2000, numOfStage + 2)[1:-1].astype('int')
+    numOfStage  = 4
+    milestones = np.linspace(0, 6000, numOfStage + 2)[1:-1].astype('int')
     milestones = milestones.tolist()
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.5)
 
     if not os.path.exists('vis'):
         os.makedirs('vis')
 
+    # 冻结 scale 参数的初始设置
+    model.scale.requires_grad = False
+
     loop = tqdm(range(loop_num))
     for i in loop:
+        # if i > 2000:
+            # model.scale.requires_grad = True
+
+
         optimizer.zero_grad()
         loss,mask_pred_list,pred_normal_1 = model()
         loss.backward()
@@ -456,6 +475,7 @@ def main():
         scheduler.step()
 
         loop.set_description(f"Loss: {loss.item()}")
+
 
         if i % 200 == 0:
 
@@ -472,7 +492,6 @@ def main():
 
             plt.title('loss: %.4f' % loss.data)
             plt.tight_layout()
-            # plt.savefig("vis/%d.png" % i)
             plt.show()
 
             # 分别将渲染的mask和参考mask以及渲染的法线图保存
@@ -496,15 +515,22 @@ def main():
     R_row = R.permute(0, 2, 1)
     T = T.unsqueeze(0)
 
+    # scale the mesh
+    scale = model.scale.item()
+    print('scale:', scale)
+    verts = model.meshes.verts_packed()
+    scaled_verts = verts * scale
+    scaled_mesh = Meshes(verts=[scaled_verts], faces=model.meshes.faces_list())
+
     final_normal_renderer = create_renderer('NormalShader', image_size=final_image_size, blend_params=blend_params,cameras=final_cameras, device=device)
-    normal_final, _ = final_normal_renderer(meshes_world=model.meshes.clone(), R=R_row, T=T)
+    normal_final, _ = final_normal_renderer(meshes_world=scaled_mesh, R=R_row, T=T)
     normal_final = normal_final.detach().squeeze().cpu().numpy()
     normal_final = (normal_final * 255).astype(np.uint8)
     normal_final = normal_final[..., ::-1]
     cv2.imwrite("final_normal.png", normal_final)
 
     final_mask_shader = create_renderer('SoftSilhouetteShader', image_size=final_image_size, blend_params=blend_params,cameras=final_cameras, device=device)
-    final_mask = final_mask_shader(meshes_world=model.meshes.clone(), R=R_row, T=T)
+    final_mask = final_mask_shader(meshes_world=scaled_mesh, R=R_row, T=T)
     final_mask = final_mask.detach().squeeze().cpu().numpy()
     final_mask = (final_mask[..., 3] > 0).astype(np.float32)
     final_mask = (final_mask * 255).astype(np.uint8)
@@ -515,7 +541,7 @@ def main():
         T_rel = model.T_rel_list[i]
         R_W2C, T_W2C = cal_R2_RT(R, T, R_rel, T_rel)
         R_W2C_row = R_W2C.permute(0, 2, 1)
-        rel_image = final_mask_shader(meshes_world=model.meshes.clone(), R=R_W2C_row, T=T_W2C)
+        rel_image = final_mask_shader(meshes_world=scaled_mesh, R=R_W2C_row, T=T_W2C)
         rel_image = rel_image.detach().squeeze().cpu().numpy()
         rel_image = (rel_image[..., 3] > 0).astype(np.float32)
         rel_image = (rel_image * 255).astype(np.uint8)
