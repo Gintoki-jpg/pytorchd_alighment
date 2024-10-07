@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import argparse
 import cv2
 import ast
+import re
 from pytorch3d.renderer.mesh.shader import ShaderBase
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 
@@ -66,12 +67,6 @@ def load_obj_mesh(obj_path, device):
     verts, faces_idx, _ = load_obj(obj_path, device=device)
     faces = faces_idx.verts_idx
 
-    # # 计算边界框以平移顶点，使边界框中心位于世界坐标系原点
-    # min_xyz = verts.min(dim=0)[0]
-    # max_xyz = verts.max(dim=0)[0]
-    # center = (min_xyz + max_xyz) / 2.0
-    # verts_translated = verts - center
-
     # 已经在blender中执行了平移操作，因此不需要再次平移
     verts_translated = verts
 
@@ -96,7 +91,7 @@ def load_obj_mesh(obj_path, device):
 
 def load_mask(mask_path):
     image = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-    image = (image > 128).astype(np.float32)
+    image = (image > 128).astype(np.float32)  # 二值化
     return image
 
 
@@ -198,7 +193,7 @@ def create_renderer(renderer_type, image_size, blend_params, cameras, device, li
 
         return normal_renderer
 
-# 转换函数以实现R=3约束
+# 转换函数以实现R自由度为3的约束
 def get_rotation_matrix(pitch, yaw, roll):
     # Ensure pitch, yaw, roll are tensors with requires_grad=True
     pitch = pitch.unsqueeze(0) if pitch.dim() == 0 else pitch
@@ -257,11 +252,6 @@ def extract_euler_angles(R):
     r21, r22, r23 = R[1, :]
     r31, r32, r33 = R[2, :]
 
-    # # 计算 yaw, pitch, roll
-    # yaw = np.arctan2(R[1, 0], R[0, 0])
-    # pitch = np.arctan2(-R[2, 0], np.sqrt(R[0, 0]**2 + R[1, 0]**2))
-    # roll = np.arctan2(R[2, 1], R[2, 2])
-
     yaw = torch.asin(-r31)
 
     # Calculate pitch
@@ -271,6 +261,40 @@ def extract_euler_angles(R):
     roll = torch.atan2(r21, r11)
 
     return pitch, yaw, roll
+
+def extrac_R_T_from_txt(txt_path):
+    with open(txt_path, 'r') as file:
+        content = file.read()
+    pattern = r'(\w+)\n([\[\]\-\d\.,\s\(\)]+)'  # 匹配变量名和数组值
+    matches = re.findall(pattern, content)
+    # 创建一个字典来存储所有变量
+    variables = {}
+    # 遍历所有匹配的变量名和值
+    for name, value_str in matches:
+        # 处理成 numpy 数组或普通 Python 列表
+        try:
+            value = eval(value_str)  # 使用 eval 直接转换字符串为数组或列表
+        except:
+            value = value_str.strip()  # 保留原始字符串
+        variables[name] = np.array(value) if isinstance(value, list) else value
+    # 提取各个变量
+    R_col_0 = variables.get('R_col_0')
+    T_col_0 = variables.get('T_col_0')
+    fcl_screen_0 = variables.get('fcl_screen_0')
+    prp_screen_0 = variables.get('prp_screen_0')
+    return R_col_0, T_col_0, fcl_screen_0, prp_screen_0
+
+def extract_rel_R_T_from_txt(txt_path):
+    with open(txt_path, 'r') as file:
+        content = file.read()
+    pattern_R = r'R_rel_\d+\s(\[\[.*?\]\])'
+    pattern_T = r'T_rel_\d+\s(\[.*?\])'
+    matches_R = re.findall(pattern_R, content,re.DOTALL)
+    matches_T = re.findall(pattern_T, content)
+
+    R_rel_list = [np.array(eval(r)) for r in matches_R]
+    T_rel_list = [np.array(eval(t)) for t in matches_T]
+    return R_rel_list, T_rel_list
 
 class Model(nn.Module):
     def __init__(self, meshes, img_renderer, normal_renderer, image_ref_list,camera_location, camera_rotation,R_rel_list,T_rel_list):
@@ -309,10 +333,9 @@ class Model(nn.Module):
         # 此处的T是1*3的平移向量W2C
         self.camera_position = nn.Parameter(torch.from_numpy(np.array(camera_location, dtype=np.float32)).to(meshes.device))
 
-        # # 设置网格缩放比例为可学习参数
-        # self.scale = nn.Parameter(torch.tensor(initial_scale, dtype=torch.float32))
 
-        self.loss_eval_image = nn.MSELoss()
+        # self.loss_eval_image = nn.MSELoss()
+        self.loss_eval_image = nn.BCELoss()
 
     def forward(self):
         # origin camera
@@ -330,15 +353,8 @@ class Model(nn.Module):
             R_W2C_row_list.append(R_W2C_row)
             T_W2C_list.append(T_W2C)
 
-        # # scale the mesh
-        # verts = self.meshes.verts_packed()
-        # scaled_verts = verts * self.scale
-        # scaled_mesh = Meshes(verts=[scaled_verts], faces=self.meshes.faces_list())
-        #
-        # # print
-        # print("scaled factor", self.scale.item())
-        # print("camera rotation", self.camera_rotation)
-        # print("camera position", self.camera_position)
+        # render normal for compare
+        normal_image,_ = self.normal_renderer(meshes_world=self.meshes.clone(), R=R_row, T=T)
 
         # render the image for the origin camera and relative cameras
         image_1 = self.img_renderer(meshes_world=self.meshes.clone(), R=R_row, T=T)
@@ -354,90 +370,59 @@ class Model(nn.Module):
 
         # calculate the loss
         image_loss = 0
-        # loss_list = []
         for i in range(len(alpha_mask_list)):
-
             loss_i = self.loss_eval_image(alpha_mask_list[i], getattr(self, f"image_ref_{i}"))
             image_loss += loss_i
-            # loss_list.append(loss_i)
 
-        # print("loss is %f, %f, %f" % (loss_list[0].item(), loss_list[1].item(), loss_list[2].item()))
+        return image_loss, alpha_mask_list,normal_image
 
-        # image_loss = self.loss_eval_image(alpha_mask_list[1], getattr(self, f"image_ref_{1}"))
-
-        # [print(loss_list[i].item()) for i in range(len(loss_list))]
-
-        return image_loss, alpha_mask_list
 
 
 def main():
     parser = argparse.ArgumentParser(description="Process some parameters for the rendering program.")
-    # parser.add_argument('--obj_path', type=str, default='./data/dog-delaunay_clean.obj', help='Path to the .obj file')
-    # parser.add_argument('--obj_path', type=str, default='./data/dog_rotate_clean.obj', help='Path to the .obj file')
-    parser.add_argument('--obj_path', type=str, default='./data/dog_rotate_2.obj', help='Path to the .obj file')
-    # parser.add_argument('--obj_path', type=str, default='./data/blackdog_center.obj', help='Path to the .obj file')
-
-    parser.add_argument('--mask_paths', type=str, nargs='+', default=['./data/mask_00.png', './data/mask_05.png','./data/mask_10.png',
-                                                                      './data/mask_15.png','./data/mask_20.png'], help='Paths to the reference mask images')
 
 
-    parser.add_argument('--camera_rotation', type=parse_nested_list, default=([[0.2654, -0.4987, 0.8251],
-                                                                               [0.5792, -0.6016, -0.5500],
-                                                                               [0.7707, 0.6239, 0.1292]]),help='Initial camera rotation(w2c)')
-    parser.add_argument('--camera_location', type=parse_tuple, default=[-0.0654,  2.6518,  3.5998], help='Initial camera location')
+    parser.add_argument('--obj_path', type=str, default='./data/face/face_rotate.obj', help='Path to the .obj file')
+    parser.add_argument('--camera_rotation_location_txt', type=str, default='./data/face/R_T_col_0.txt', help='Path to the origin camera rotation and location txt file')
+    parser.add_argument('--relative_rotation_location_txt', type=str, default='./data/face/R_T_rel.txt', help='Path to the relative rotation and location txt file')
+    parser.add_argument('--relative_cameras',type = parse_nested_list,nargs='+',default=[5,10,15,20],help='The camera number for the pickle file')
+    parser.add_argument('--loop_num', type=int, default=3000, help='Number of iterations')
+    parser.add_argument('--image_size', type=parse_tuple, default=(128, 153), help='Size of the train image')
+    parser.add_argument('--final_image_size', type=parse_tuple, default=(1024, 1224),help='Size of the output image')
 
-
-
-    parser.add_argument('--R_rel', type=parse_nested_list,nargs='+', default=([[[-0.0584,  0.5365,  0.8419],
-                                                                                     [-0.5677,  0.6758, -0.4700],
-                                                                                     [-0.8211, -0.5054,  0.2651]],
-                                                                               [[-0.9746, 0.0975, 0.2015],
-                                                                                [-0.1475, 0.3971, -0.9058],
-                                                                                [-0.1683, -0.9126, -0.3727]],
-                                                                               [[-0.5112, -0.4939, -0.7034],
-                                                                                [0.4541, 0.5397, -0.7089],
-                                                                                [0.7297, -0.6818, -0.0516]],
-                                                                               [[0.5729, -0.4576, -0.6800],
-                                                                                [0.4492, 0.8692, -0.2065],
-                                                                                [0.6856, -0.1872, 0.7035]]
-                                                                               ]), help='Relative rotation matrices')
-    parser.add_argument('--T_rel', type=parse_nested_list,nargs='+', default=([[-3.6398,  2.2759,  3.5975],
-                                                                               [-0.5309, 4.2041, 6.4695],
-                                                                               [4.0681, 3.2073, 4.8001],
-                                                                               [2.9877, 0.8685, 1.3180]
-                                                                               ]), help='Relative translation vectors')
-
-    parser.add_argument('--loop_num', type=int, default=5000, help='Number of iterations')
-    parser.add_argument('--image_size', type=parse_tuple, default=(128, 153), help='Size of the output image')
-    parser.add_argument('--final_image_size', type=parse_tuple, default=(1024, 1224),help='Size of the output normal image')
-    # parser.add_argument('--initial_scale', type=float, default=1/70, help='Initial scale of the mesh')
+    parser.add_argument('--mask_paths', type=str, nargs='+', default=['./data/face/mask_00.png', './data/face/mask_05.png',
+                                                                       './data/face/mask_10.png',
+                                                                      './data/face/mask_15.png',
+                                                                      './data/face/mask_20.png'], help='Paths to the reference mask images')
 
     args = parser.parse_args()
 
     obj_path = args.obj_path
     mask_paths_list = args.mask_paths
+    loop_num = args.loop_num
+    train_image_size = args.image_size
+    final_image_size = args.final_image_size
+    relative_cameras = args.relative_cameras
+    camera_rotaion_location_path = args.camera_rotation_location_txt
+    relative_rotation_location_path = args.relative_rotation_location_txt
 
-    camera_location = args.camera_location
-    camera_rotation = args.camera_rotation
+    camera_rotation, camera_location, fcl_screen_0, prp_screen_0 = extrac_R_T_from_txt(camera_rotaion_location_path)
     camera_rotation_angle = extract_euler_angles(torch.tensor(camera_rotation, dtype=torch.float32))
 
-
-    loop_num = args.loop_num
-    image_size = args.image_size
-    final_image_size = args.final_image_size
-
-    R_rel_list = args.R_rel
-    T_rel_list = args.T_rel
-
-    # initial_scale = args.initial_scale
+    R_rel_list_all, T_rel_list_all = extract_rel_R_T_from_txt(relative_rotation_location_path)
+    R_rel_list = [R_rel_list_all[i-1] for i in relative_cameras]
+    T_rel_list = [T_rel_list_all[i-1] for i in relative_cameras]
 
 
 ############################################################################################################
     obj_mesh = load_obj_mesh(obj_path, device=device)
-    cameras = PerspectiveCameras(focal_length=((291.76901860550583, 291.76901860550583),),principal_point=((76.6875, 64.0625),), in_ndc=False, image_size=(image_size,),device=device)
+    train_cameras = PerspectiveCameras(focal_length=fcl_screen_0,principal_point=prp_screen_0, in_ndc=False, image_size=(train_image_size,),device=device)
+    final_cameras = PerspectiveCameras(focal_length=((fcl_screen_0[0][0] * 8, fcl_screen_0[0][1] * 8),),principal_point=((prp_screen_0[0][0]*8,prp_screen_0[0][1]*8),), in_ndc=False, image_size=(final_image_size,),device=device)
+
+
     blend_params = BlendParams(sigma=1e-4, gamma=1e-4)  # 默认渲染参数
-    silhouette_renderer = create_renderer('SoftSilhouetteShader', image_size=image_size, blend_params=blend_params,cameras=cameras, device=device)
-    normal_renderer = create_renderer('NormalShader', image_size=image_size, blend_params=blend_params, cameras=cameras,device=device)
+    silhouette_renderer = create_renderer('SoftSilhouetteShader', image_size=train_image_size, blend_params=blend_params,cameras=train_cameras, device=device)
+    normal_renderer = create_renderer('NormalShader', image_size=train_image_size, blend_params=blend_params, cameras=train_cameras,device=device)
 
     if len(mask_paths_list) == 0:
         raise ValueError("The mask_paths_list is empty.")
@@ -445,14 +430,19 @@ def main():
         mask_list = []
         for mask_path in mask_paths_list:
             mask = load_mask(mask_path)
-            mask_resized = cv2.resize(mask, (image_size[1], image_size[0]))
-            mask_resized = (mask_resized>0).astype(np.float32)
+            mask_resized = cv2.resize(mask, (train_image_size[1], train_image_size[0]))
+            # 此处到底是否需要转换为0-1的值？
+            # mask_resized = (mask_resized>0).astype(np.float32)
             mask_list.append(mask_resized)
 
 ############################################################################################################
     model = Model(obj_mesh, silhouette_renderer, normal_renderer, mask_list, camera_location, camera_rotation_angle, R_rel_list, T_rel_list)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.2)
+
+    numOfStage  = 3
+    milestones = np.linspace(0, 2000, numOfStage + 2)[1:-1].astype('int')
+    milestones = milestones.tolist()
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.5)
 
     if not os.path.exists('vis'):
         os.makedirs('vis')
@@ -460,42 +450,77 @@ def main():
     loop = tqdm(range(loop_num))
     for i in loop:
         optimizer.zero_grad()
-        loss,mask_pred_list = model()
+        loss,mask_pred_list,pred_normal_1 = model()
         loss.backward()
         optimizer.step()
-        # scheduler.step()
+        scheduler.step()
 
         loop.set_description(f"Loss: {loss.item()}")
 
         if i % 200 == 0:
-            subplot_n = len(mask_pred_list)*2
-            for j in range(len(mask_pred_list)):
-                plt.subplot(1, subplot_n, 1+j*2)
-                plt.imshow(mask_pred_list[j].cpu().detach().numpy())
-                plt.axis('off')
-                plt.subplot(1, subplot_n, 2+j*2)
-                plt.imshow(getattr(model, f"image_ref_{j}").cpu().detach().numpy())
-                plt.axis('off')
+
+            plt.subplot(1, 3, 1)
+            plt.imshow(mask_pred_list[0].cpu().detach().numpy())
+            plt.axis('off')
+            plt.subplot(1, 3, 2)
+            plt.imshow(getattr(model, f"image_ref_{0}").cpu().detach().numpy())
+            plt.axis('off')
+            plt.subplot(1, 3, 3)
+            plt.imshow(pred_normal_1[0].cpu().detach().numpy())
+            plt.axis('off')
+
+
             plt.title('loss: %.4f' % loss.data)
             plt.tight_layout()
-            plt.savefig("vis/%d.png" % i)
+            # plt.savefig("vis/%d.png" % i)
             plt.show()
+
+            # 分别将渲染的mask和参考mask以及渲染的法线图保存
+            mask_pred = mask_pred_list[0].cpu().detach().numpy()
+            mask_pred = (mask_pred * 255).astype(np.uint8)
+            cv2.imwrite(f"vis/mask_pred_{i}.png", mask_pred)
+            mask_ref = getattr(model, f"image_ref_{0}").cpu().detach().numpy()
+            mask_ref = (mask_ref * 255).astype(np.uint8)
+            cv2.imwrite(f"vis/mask_ref_{i}.png", mask_ref)
+            normal_pred = pred_normal_1[0].cpu().detach().numpy()
+            normal_pred = (normal_pred * 255).astype(np.uint8)
+            cv2.imwrite(f"vis/normal_pred_{i}.png", normal_pred)
 
 
         if loss.item() < 0.001:
+            print("The loss is less than 0.001, the training is finished.")
             break
 
     R = get_rotation_matrix(model.camera_rotation[0], model.camera_rotation[1], model.camera_rotation[2])
     T = model.camera_position
     R_row = R.permute(0, 2, 1)
     T = T.unsqueeze(0)
-    final_normal_renderer = create_renderer('NormalShader', image_size=final_image_size, blend_params=blend_params,cameras=cameras, device=device)
 
+    final_normal_renderer = create_renderer('NormalShader', image_size=final_image_size, blend_params=blend_params,cameras=final_cameras, device=device)
     normal_final, _ = final_normal_renderer(meshes_world=model.meshes.clone(), R=R_row, T=T)
     normal_final = normal_final.detach().squeeze().cpu().numpy()
     normal_final = (normal_final * 255).astype(np.uint8)
     normal_final = normal_final[..., ::-1]
     cv2.imwrite("final_normal.png", normal_final)
+
+    final_mask_shader = create_renderer('SoftSilhouetteShader', image_size=final_image_size, blend_params=blend_params,cameras=final_cameras, device=device)
+    final_mask = final_mask_shader(meshes_world=model.meshes.clone(), R=R_row, T=T)
+    final_mask = final_mask.detach().squeeze().cpu().numpy()
+    final_mask = (final_mask[..., 3] > 0).astype(np.float32)
+    final_mask = (final_mask * 255).astype(np.uint8)
+    cv2.imwrite("final_mask_0.png", final_mask)
+
+    for i in range(len(R_rel_list)):
+        R_rel = model.R_rel_list[i]
+        T_rel = model.T_rel_list[i]
+        R_W2C, T_W2C = cal_R2_RT(R, T, R_rel, T_rel)
+        R_W2C_row = R_W2C.permute(0, 2, 1)
+        rel_image = final_mask_shader(meshes_world=model.meshes.clone(), R=R_W2C_row, T=T_W2C)
+        rel_image = rel_image.detach().squeeze().cpu().numpy()
+        rel_image = (rel_image[..., 3] > 0).astype(np.float32)
+        rel_image = (rel_image * 255).astype(np.uint8)
+        cv2.imwrite(f"final_mask_{relative_cameras[i]}.png", rel_image)
+
 
 if __name__ == '__main__':
     main()
