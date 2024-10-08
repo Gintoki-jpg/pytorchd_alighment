@@ -236,7 +236,7 @@ def get_rotation_matrix(pitch, yaw, roll):
      torch.stack([zeros, zeros, ones], dim=-1)
     ], dim=-2)
 
-    # Combine the rotation matrices C2W
+    # Combine the rotation matrices
     R = torch.matmul(R_z, torch.matmul(R_y, R_x))
 
     # # If the inputs were scalars, remove the extra dimension
@@ -388,7 +388,22 @@ class Model(nn.Module):
 
         return image_loss, alpha_mask_list,normal_image
 
+def save_normal(render_normal,R, save_path):
+    # 世界法线图转换为相机法线图
+    R_w2c = R[0]
+    render_normal = render_normal[0]
+    H, W, _ = render_normal.shape
+    render_normal_flat = render_normal.view(-1, 3)
+    rotated_normal_flat = torch.matmul(render_normal_flat, R_w2c.T)
+    rotated_normal = rotated_normal_flat.view(H, W, 3)
+    rotated_normal[:, :, 2] = -rotated_normal[:, :, 2]
 
+    rotated_normal = (rotated_normal + 1) / 2 * 255
+    rotated_normal_np = rotated_normal.detach().cpu().numpy()
+    # cv2.imwrite(save_path, rotated_normal_np[..., ::-1])
+    # cv2.imwrite(save_path, rotated_normal_np)
+    # 交换通道顺序
+    cv2.imwrite(save_path, rotated_normal_np[:, :, [2, 1, 0]])
 
 def main():
     parser = argparse.ArgumentParser(description="Process some parameters for the rendering program.")
@@ -398,10 +413,11 @@ def main():
     parser.add_argument('--camera_rotation_location_txt', type=str, default='./data/face/R_T_col_0.txt', help='Path to the origin camera rotation and location txt file')
     parser.add_argument('--relative_rotation_location_txt', type=str, default='./data/face/R_T_rel.txt', help='Path to the relative rotation and location txt file')
     parser.add_argument('--relative_cameras',type = parse_nested_list,nargs='+',default=[5,10,15,20],help='The camera number for the pickle file')
-    parser.add_argument('--loop_num', type=int, default=8000, help='Number of iterations')
+    parser.add_argument('--loop_num', type=int, default=6000, help='Number of iterations')
     parser.add_argument('--image_size', type=parse_tuple, default=(128, 153), help='Size of the train image')
     parser.add_argument('--final_image_size', type=parse_tuple, default=(1024, 1224),help='Size of the output image')
     parser.add_argument('--initial_scale', type=float, default=1.0, help='Initial scale of the mesh')
+    parser.add_argument('--save_path', type=str, default='./normal_results', help='Path to save the output normal image')
 
     parser.add_argument('--mask_paths', type=str, nargs='+', default=['./data/face/mask_00.png', './data/face/mask_05.png',
                                                                        './data/face/mask_10.png',
@@ -417,6 +433,10 @@ def main():
     final_image_size = args.final_image_size
     relative_cameras = args.relative_cameras
     initial_scale = args.initial_scale
+    save_path = args.save_path
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+
     camera_rotaion_location_path = args.camera_rotation_location_txt
     relative_rotation_location_path = args.relative_rotation_location_txt
 
@@ -451,8 +471,8 @@ def main():
     model = Model(obj_mesh, silhouette_renderer, normal_renderer, mask_list, camera_location, camera_rotation_angle, R_rel_list, T_rel_list,initial_scale)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    numOfStage  = 4
-    milestones = np.linspace(0, 6000, numOfStage + 2)[1:-1].astype('int')
+    numOfStage  = 3
+    milestones = np.linspace(0, 5000, numOfStage + 2)[1:-1].astype('int')
     milestones = milestones.tolist()
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.5)
 
@@ -494,25 +514,24 @@ def main():
             plt.tight_layout()
             plt.show()
 
-            # 分别将渲染的mask和参考mask以及渲染的法线图保存
-            mask_pred = mask_pred_list[0].cpu().detach().numpy()
-            mask_pred = (mask_pred * 255).astype(np.uint8)
-            cv2.imwrite(f"vis/mask_pred_{i}.png", mask_pred)
-            mask_ref = getattr(model, f"image_ref_{0}").cpu().detach().numpy()
-            mask_ref = (mask_ref * 255).astype(np.uint8)
-            cv2.imwrite(f"vis/mask_ref_{i}.png", mask_ref)
-            normal_pred = pred_normal_1[0].cpu().detach().numpy()
-            normal_pred = (normal_pred * 255).astype(np.uint8)
-            cv2.imwrite(f"vis/normal_pred_{i}.png", normal_pred)
 
 
         if loss.item() < 0.001:
             print("The loss is less than 0.001, the training is finished.")
             break
 
+############################################################################################################
+    # 将R和T保存在txt文档中
+    txt_path = os.path.join(save_path, 'R_T_final.txt')
+
     R = get_rotation_matrix(model.camera_rotation[0], model.camera_rotation[1], model.camera_rotation[2])
     T = model.camera_position
-    R_row = R.permute(0, 2, 1)
+    # 计入文档
+    with open(txt_path, 'w') as file:
+        file.write(f"R_col_0\n{R.cpu().detach().numpy()}\n")
+        file.write(f"T_col_0\n{T.cpu().detach().numpy()}\n")
+
+    R_row = R.permute(0, 2, 1) # W2C下的旋转矩阵，行主序
     T = T.unsqueeze(0)
 
     # scale the mesh
@@ -523,29 +542,26 @@ def main():
     scaled_mesh = Meshes(verts=[scaled_verts], faces=model.meshes.faces_list())
 
     final_normal_renderer = create_renderer('NormalShader', image_size=final_image_size, blend_params=blend_params,cameras=final_cameras, device=device)
-    normal_final, _ = final_normal_renderer(meshes_world=scaled_mesh, R=R_row, T=T)
-    normal_final = normal_final.detach().squeeze().cpu().numpy()
-    normal_final = (normal_final * 255).astype(np.uint8)
-    normal_final = normal_final[..., ::-1]
-    cv2.imwrite("final_normal.png", normal_final)
+    _,render_normal = final_normal_renderer(meshes_world=scaled_mesh, R=R_row, T=T)
+    save_path_0 = os.path.join(save_path, "normal_00.png")
+    save_normal(render_normal, R, save_path_0)
 
-    final_mask_shader = create_renderer('SoftSilhouetteShader', image_size=final_image_size, blend_params=blend_params,cameras=final_cameras, device=device)
-    final_mask = final_mask_shader(meshes_world=scaled_mesh, R=R_row, T=T)
-    final_mask = final_mask.detach().squeeze().cpu().numpy()
-    final_mask = (final_mask[..., 3] > 0).astype(np.float32)
-    final_mask = (final_mask * 255).astype(np.uint8)
-    cv2.imwrite("final_mask_0.png", final_mask)
 
-    for i in range(len(R_rel_list)):
-        R_rel = model.R_rel_list[i]
-        T_rel = model.T_rel_list[i]
+    for i in range(len(R_rel_list_all)):
+        R_rel = torch.tensor(R_rel_list_all[i], dtype=torch.float32, device=device)
+        T_rel = torch.tensor(T_rel_list_all[i], dtype=torch.float32, device=device)
         R_W2C, T_W2C = cal_R2_RT(R, T, R_rel, T_rel)
-        R_W2C_row = R_W2C.permute(0, 2, 1)
-        rel_image = final_mask_shader(meshes_world=scaled_mesh, R=R_W2C_row, T=T_W2C)
-        rel_image = rel_image.detach().squeeze().cpu().numpy()
-        rel_image = (rel_image[..., 3] > 0).astype(np.float32)
-        rel_image = (rel_image * 255).astype(np.uint8)
-        cv2.imwrite(f"final_mask_{relative_cameras[i]}.png", rel_image)
+        # 计入文档
+        with open(txt_path, 'a') as file:
+            file.write(f"R_col_{i+1}\n{R_W2C.cpu().detach().numpy()}\n")
+            file.write(f"T_col_{i+1}\n{T_W2C.cpu().detach().numpy()}\n")
+        R_W2C_row = R_W2C.permute(0, 2, 1) # pytorch3d中使用行主序为标准
+        _,render_normal = final_normal_renderer(meshes_world=scaled_mesh, R=R_W2C_row, T=T_W2C)
+        save_path_i = os.path.join(save_path, f"normal_{i+1:02d}.png")
+        save_normal(render_normal, R_W2C, save_path_i)
+
+
+
 
 
 if __name__ == '__main__':
